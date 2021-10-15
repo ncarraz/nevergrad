@@ -2,7 +2,6 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-import os
 import math
 import logging
 import itertools
@@ -40,8 +39,6 @@ try:
 except ModuleNotFoundError:
     pass
 
-# run with LOGLEVEL=DEBUG for more debug information
-logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 
@@ -1423,7 +1420,7 @@ class InfiniteMetaModelOptimum(ValueError):
     """Sometimes the optimum of the metamodel is at infinity."""
 
 
-def learn_on_k_best(archive: utils.Archive[utils.MultiValue], k: int) -> tp.ArrayLike:
+def _learn_on_k_best(archive: utils.Archive[utils.MultiValue], k: int) -> tp.ArrayLike:
     """Approximate optimum learnt from the k best.
 
     Parameters
@@ -1473,15 +1470,13 @@ def learn_on_k_best(archive: utils.Archive[utils.MultiValue], k: int) -> tp.Arra
     return middle + normalization * minimum
 
 
-@registry.register
-class MetaModel(base.Optimizer):
-    """Adding a metamodel into CMA."""
-
+class _MetaModel(base.Optimizer):
     def __init__(
         self,
         parametrization: IntOrParameter,
         budget: tp.Optional[int] = None,
         num_workers: int = 1,
+        *,
         multivariate_optimizer: tp.Optional[base.OptCls] = None,
     ) -> None:
         super().__init__(parametrization, budget=budget, num_workers=num_workers)
@@ -1499,7 +1494,7 @@ class MetaModel(base.Optimizer):
             and len(self.archive) >= sample_size
         ):
             try:
-                data = learn_on_k_best(self.archive, sample_size)
+                data = _learn_on_k_best(self.archive, sample_size)
                 candidate = self.parametrization.spawn_child().set_standardized_data(data)
             except InfiniteMetaModelOptimum:  # The optimum is at infinity. Shit happens.
                 candidate = self._optim.ask()
@@ -1509,6 +1504,32 @@ class MetaModel(base.Optimizer):
 
     def _internal_tell_candidate(self, candidate: p.Parameter, loss: tp.FloatLoss) -> None:
         self._optim.tell(candidate, loss)
+
+
+class ParametrizedMetaModel(base.ConfiguredOptimizer):
+    """
+    Adds a metamodel to an optimizer.
+    The optimizer is alway OnePlusOne if dimension is 1.
+
+    Parameters
+    ----------
+    multivariate_optimizer: base.OptCls or None
+        Optimizer to which the metamodel is added
+    """
+
+    # pylint: disable=unused-argument
+    def __init__(
+        self,
+        *,
+        multivariate_optimizer: tp.Optional[base.OptCls] = None,
+    ) -> None:
+        super().__init__(_MetaModel, locals())
+
+
+MetaModel = ParametrizedMetaModel().set_name("MetaModel", register=True)
+MetaModelOnePlusOne = ParametrizedMetaModel(multivariate_optimizer=OnePlusOne).set_name(
+    "MetaModelOnePlusOne", register=True
+)
 
 
 @registry.register
@@ -1678,7 +1699,7 @@ class _BO(base.Optimizer):
         gp_parameters: tp.Optional[tp.Dict[str, tp.Any]] = None,
     ) -> None:
         super().__init__(parametrization, budget=budget, num_workers=num_workers)
-        self._transform = transforms.ArctanBound(0, 1)
+        self._normalizer = p.helpers.Normalizer(self.parametrization)
         self._bo: tp.Optional[BayesianOptimization] = None
         self._fake_function = _FakeFunction(num_digits=len(str(self.dimension)))
         # initialization
@@ -1727,7 +1748,7 @@ class _BO(base.Optimizer):
                 self._bo.probe([0.5] * self.dimension, lazy=True)
                 init_budget -= 1
             if self._InitOpt is not None and init_budget > 0:
-                param = p.Array(shape=(self.dimension,)).set_bounds(lower=0, upper=1.0)
+                param = p.Array(shape=(self.dimension,)).set_bounds(lower=0, upper=1)
                 param.random_state = self._rng
                 opt = self._InitOpt(param, budget=init_budget)
                 for _ in range(init_budget):
@@ -1744,7 +1765,7 @@ class _BO(base.Optimizer):
         else:
             x_probe = self.bo.suggest(util)  # this is time consuming
             x_probe = [x_probe[self._fake_function.key(i)] for i in range(len(x_probe))]
-        data = self._transform.backward(np.array(x_probe, copy=False))
+        data = self._normalizer.backward(np.array(x_probe, copy=False))
         candidate = self.parametrization.spawn_child().set_standardized_data(data)
         candidate._meta["x_probe"] = x_probe
         return candidate
@@ -1754,7 +1775,7 @@ class _BO(base.Optimizer):
             y = candidate._meta["x_probe"]
         else:
             data = candidate.get_standardized_data(reference=self.parametrization)
-            y = self._transform.forward(data)  # tell not asked
+            y = self._normalizer.forward(data)  # tell not asked
         self._fake_function.register(y, -loss)  # minimizing
         self.bo.probe(y, lazy=False)
         # for some unknown reasons, BO wants to evaluate twice the same point,
@@ -1765,7 +1786,7 @@ class _BO(base.Optimizer):
     def _internal_provide_recommendation(self) -> tp.Optional[tp.ArrayLike]:
         if not self.archive:
             return None
-        return self._transform.backward(
+        return self._normalizer.backward(
             np.array([self.bo.max["params"][self._fake_function.key(i)] for i in range(self.dimension)])
         )
 
@@ -1828,12 +1849,11 @@ class _BayesOptim(base.Optimizer):
         self._config = BayesOptim() if config is None else config
         cfg = self._config
         super().__init__(parametrization, budget=budget, num_workers=num_workers)
-        self._transform = transforms.ArctanBound(0, 1)
+        self._normalizer = p.helpers.Normalizer(self.parametrization)
 
         from bayes_optim import RealSpace
         from bayes_optim.surrogate import GaussianProcess
 
-        # lb, ub = 1e-7 - np.pi / 2, np.pi / 2 - 1e-7
         lb, ub = 1e-7, 1 - 1e-7
         space = RealSpace([lb, ub]) * self.dimension
 
@@ -1860,16 +1880,16 @@ class _BayesOptim(base.Optimizer):
                 acquisition_optimization={"optimizer": "BFGS"},
             )
         else:
-            from bayes_optim import BO as BayesOptimBO
+            from bayes_optim import BO as BayesOptimBO_
 
             # hyperparameters of the GPR model
             thetaL = 1e-10 * (ub - lb) * np.ones(self.dimension)
             thetaU = 10 * (ub - lb) * np.ones(self.dimension)
             model = GaussianProcess(thetaL=thetaL, thetaU=thetaU)  # create the GPR model
 
-            self._alg = BayesOptimBO(
+            self._alg = BayesOptimBO_(
                 search_space=space,
-                obj_fun=None,  # Assuming that this is not used :-)
+                obj_fun=None,
                 model=model,
                 DoE_size=init_budget if init_budget is not None else 5,
                 max_FEs=budget,
@@ -1883,7 +1903,7 @@ class _BayesOptim(base.Optimizer):
                 candidate = candidate.tolist()
             self._buffer = candidate
         x_probe = self._buffer.pop()
-        data = self._transform.backward(np.array(x_probe, copy=False))
+        data = self._normalizer.backward(np.array(x_probe, copy=False))
         candidate = self.parametrization.spawn_child().set_standardized_data(data)
         candidate._meta["x_probe"] = x_probe
         return candidate
@@ -1897,7 +1917,7 @@ class _BayesOptim(base.Optimizer):
             else:
                 data = candidate.get_standardized_data(reference=self.parametrization)
                 # Tell not asked:
-                self._alg.tell(self._transform.forward(data), loss)
+                self._alg.tell(self._normalizer.forward(data), loss)
             self._newX = []
             self._losses = []
 
@@ -2616,7 +2636,42 @@ class NGOpt14(NGOpt12):  # Also known as NGOpt12H_nohyperopt
 
 
 @registry.register
-class NGOpt(NGOpt14):
+class NGOpt15(NGOpt12):
+    def _select_optimizer_cls(self) -> base.OptCls:
+        if (
+            self.budget is not None
+            and self.fully_continuous
+            and self.budget < self.dimension ** 2 * 2
+            and self.num_workers == 1
+            and not self.has_noise
+            and self.num_objectives < 2
+        ):
+            return MetaModelOnePlusOne  # OnePlusOne seems equivalent so far
+        elif self.fully_continuous and self.budget is not None and self.budget < 600:
+            return MetaModel
+        else:
+            return super()._select_optimizer_cls()
+
+
+@registry.register
+class NGOpt16(NGOpt15):
+    def _select_optimizer_cls(self) -> base.OptCls:
+        if (
+            self.budget is not None
+            and self.fully_continuous
+            and self.budget < 200 * self.dimension
+            and self.num_workers == 1
+            and not self.has_noise
+            and self.num_objectives < 2
+            and p.helpers.Normalizer(self.parametrization).fully_bounded
+        ):
+            return Cobyla
+        else:
+            return super()._select_optimizer_cls()
+
+
+@registry.register
+class NGOpt(NGOpt16):
     pass
 
 
